@@ -25,6 +25,12 @@ final class NostrService: ObservableObject {
     @Published var log: [String] = []         // human-readable event/relay log
     @Published var isConnected = false
 
+    // Chat rooms (build step 2): full parsed messages, in chronological order.
+    @Published var roomMessages: [ChatMessage] = []
+
+    // Mute (NIP-51, kind 10000): pubkeys this user has muted.
+    @Published var mutedPubkeys: Set<String> = []
+
     private var session: URLSession?
     private var task: URLSessionWebSocketTask?
     private var privateKey: secp256k1.Signing.PrivateKey?
@@ -61,6 +67,10 @@ final class NostrService: ObservableObject {
         listen()
     }
 
+    /// The current user's public key (x-only hex). The ViewModel uses this to
+    /// tell "my" messages from others'. Empty until `start()` has run.
+    var myPubkey: String { pubkeyHex }
+
     // MARK: - Receive loop (async/await)
 
     private func listen() {
@@ -90,7 +100,7 @@ final class NostrService: ObservableObject {
         guard let task else { append("⚠️ not connected"); return }
 
         do {
-            let event = try makeSignedNote(content: trimmed)
+            let event = try makeSignedNote(content: trimmed, room: roomTag)
             let wire = try wireMessage(["EVENT", event])   // ["EVENT", {event}]
             Task {
                 do { try await task.send(.string(wire)) }
@@ -120,13 +130,169 @@ final class NostrService: ObservableObject {
         }
     }
 
+    // MARK: - Chat rooms (build step 2)
+
+    /// Subscribe to a specific room by its tag (e.g. "fanrelay:nfl:eagles").
+    /// New notes for that room then flow in through `ingestEvent`, which turns
+    /// each one into a `ChatMessage` appended to `roomMessages`.
+    func subscribe(toRoom room: String, subscriptionId: String = "fanrelay-room") {
+        guard let task else { append("⚠️ not connected"); return }
+        let filter: [String: Any] = ["kinds": [1], "#t": [room], "limit": 50]
+        do {
+            let wire = try wireMessage(["REQ", subscriptionId, filter])
+            Task {
+                do { try await task.send(.string(wire)) }
+                catch { self.append("❌ subscribe failed: \(error.localizedDescription)") }
+            }
+            append("👂 subscribed to #\(room)")
+        } catch {
+            append("❌ subscribe build failed: \(error)")
+        }
+    }
+
+    /// Build, sign, and publish a kind-1 note to a specific room.
+    /// Content rules (empty / length / trim) are enforced by the ViewModel;
+    /// this method handles the signing + transport and reports any failure.
+    func publish(content: String, toRoom room: String) {
+        guard let task else { append("⚠️ not connected"); return }
+        do {
+            let event = try makeSignedNote(content: content, room: room)
+            let wire = try wireMessage(["EVENT", event])
+            Task {
+                do { try await task.send(.string(wire)) }
+                catch { self.append("❌ send failed: \(error.localizedDescription)") }
+            }
+            append("📤 posted to #\(room)")
+        } catch {
+            append("❌ build/sign failed: \(error)")
+        }
+    }
+
+    /// Route an incoming NIP-01 event by kind: kind 1 → chat message,
+    /// kind 10000 → this user's mute list. Other kinds are ignored for now.
+    func ingestEvent(_ ev: [String: Any]) {
+        let kind = ev["kind"] as? Int ?? -1
+
+        if kind == 10000 {
+            applyMuteEvent(ev)
+            return
+        }
+        guard kind == 1 else { return }
+
+        guard
+            let id = ev["id"] as? String,
+            let pubkey = ev["pubkey"] as? String,
+            let content = ev["content"] as? String,
+            let createdAtRaw = ev["created_at"] as? Int
+        else { return }
+
+        // Keep the slice's plain-text list + log working too.
+        messages.append(content)
+        append("📥 \(content)")
+
+        guard !roomMessages.contains(where: { $0.id == id }) else { return }
+
+        let message = ChatMessage(
+            id: id,
+            pubkey: pubkey,
+            roomId: firstRoomTag(in: ev) ?? "",
+            content: content,
+            createdAt: Date(timeIntervalSince1970: TimeInterval(createdAtRaw)),
+            sig: ev["sig"] as? String ?? ""
+        )
+        roomMessages.append(message)
+        roomMessages.sort { $0.createdAt < $1.createdAt }   // oldest → newest
+    }
+
+    /// The room a note belongs to is the value of its first `t` tag
+    /// (NIP-01 only indexes the first value of any tag).
+    private func firstRoomTag(in ev: [String: Any]) -> String? {
+        guard let tags = ev["tags"] as? [[String]] else { return nil }
+        for tag in tags where tag.first == "t" && tag.count > 1 {
+            return tag[1]
+        }
+        return nil
+    }
+
+    // MARK: - Mute list (NIP-51, kind 10000)
+
+    /// Fetch this user's latest mute list. Replaceable, so `limit: 1` gives the
+    /// current one; its `p` tags are parsed in `applyMuteEvent`.
+    func loadMuteList() {
+        guard let task else { return }
+        let filter: [String: Any] = ["kinds": [10000], "authors": [pubkeyHex], "limit": 1]
+        do {
+            let wire = try wireMessage(["REQ", "fanrelay-mute", filter])
+            Task {
+                do { try await task.send(.string(wire)) }
+                catch { self.append("❌ mute fetch failed: \(error.localizedDescription)") }
+            }
+            append("🔇 fetching mute list")
+        } catch {
+            append("❌ mute fetch build failed: \(error)")
+        }
+    }
+
+    /// Add a pubkey to the mute list and publish the updated (replaceable) list.
+    func mute(pubkey: String) {
+        var set = mutedPubkeys
+        set.insert(pubkey)
+        publishMuteList(set)
+    }
+
+    /// Remove a pubkey and publish the updated list. (Used later from Settings.)
+    func unmute(pubkey: String) {
+        var set = mutedPubkeys
+        set.remove(pubkey)
+        publishMuteList(set)
+    }
+
+    /// Read a kind-10000 event's `p` tags into the muted set. Replaceable, so
+    /// the newest one simply replaces what we had.
+    private func applyMuteEvent(_ ev: [String: Any]) {
+        guard let tags = ev["tags"] as? [[String]] else { return }
+        var set = Set<String>()
+        for tag in tags where tag.first == "p" && tag.count > 1 {
+            set.insert(tag[1])
+        }
+        mutedPubkeys = set
+        append("🔇 mute list loaded (\(set.count))")
+    }
+
+    /// Sign + publish the mute list as one kind-10000 event with one `p` tag
+    /// per muted author. Updates the local set optimistically so the UI reacts
+    /// immediately (the relay also echoes it back to the open mute subscription).
+    private func publishMuteList(_ pubkeys: Set<String>) {
+        guard let task else { append("⚠️ not connected"); return }
+        let tags = pubkeys.map { ["p", $0] }
+        do {
+            let event = try makeSignedEvent(kind: 10000, tags: tags, content: "")
+            let wire = try wireMessage(["EVENT", event])
+            Task {
+                do { try await task.send(.string(wire)) }
+                catch { self.append("❌ mute publish failed: \(error.localizedDescription)") }
+            }
+            mutedPubkeys = pubkeys
+            append("🔇 mute list updated (\(pubkeys.count))")
+        } catch {
+            append("❌ mute build/sign failed: \(error)")
+        }
+    }
+
     // MARK: - Build + sign a NIP-01 event
 
-    private func makeSignedNote(content: String) throws -> [String: Any] {
+    /// kind-1 room note — a thin wrapper over the generic signer.
+    private func makeSignedNote(content: String, room: String) throws -> [String: Any] {
+        try makeSignedEvent(kind: 1, tags: [["t", room]], content: content)
+    }
+
+    /// Generic NIP-01 signer: id = SHA-256 of the canonical serialization,
+    /// then a BIP-340 Schnorr signature over that id. Same crypto the slice
+    /// proved; `kind` and `tags` are now parameters so chat notes (kind 1) and
+    /// mute lists (kind 10000) share one code path.
+    private func makeSignedEvent(kind: Int, tags: [[String]], content: String) throws -> [String: Any] {
         guard let sk = privateKey else { throw NostrError.noKey }
         let createdAt = Int(Date().timeIntervalSince1970)
-        let kind = 1
-        let tags = [["t", roomTag]]   // ONE room tag (NIP-01: only first value indexed)
 
         // id = sha256 of the canonical serialization [0,pubkey,created_at,kind,tags,content]
         let serialized = canonicalSerialization(pubkey: pubkeyHex,
@@ -192,10 +358,8 @@ final class NostrService: ObservableObject {
 
         switch type {
         case "EVENT":   // ["EVENT", subId, {event}]
-            if arr.count >= 3, let ev = arr[2] as? [String: Any],
-               let content = ev["content"] as? String {
-                messages.append(content)
-                append("📥 \(content)")
+            if arr.count >= 3, let ev = arr[2] as? [String: Any] {
+                ingestEvent(ev)
             }
         case "OK":      // ["OK", id, accepted, message]
             let id = (arr.count > 1 ? arr[1] as? String : nil) ?? ""
