@@ -39,18 +39,13 @@ struct ChatRoomView: View {
                 } else {
                     LazyVStack(spacing: 8) {
                         ForEach(vm.messages) { message in
-                            MessageRow(message: message, isMine: vm.isMine(message))
-                                .id(message.id)
-                                // Long-press another fan's message to mute them.
-                                .contextMenu {
-                                    if !vm.isMine(message) {
-                                        Button(role: .destructive) {
-                                            vm.mute(message)
-                                        } label: {
-                                            Label("Mute this fan", systemImage: "speaker.slash")
-                                        }
-                                    }
-                                }
+                            MessageRow(
+                                message: message,
+                                isMine: vm.isMine(message),
+                                // Only other people's messages get a mute action.
+                                onMute: vm.isMine(message) ? nil : { vm.mute(message) }
+                            )
+                            .id(message.id)
                         }
                     }
                     .padding(.horizontal, 12)
@@ -155,12 +150,15 @@ struct ChatRoomView: View {
 
 /// A single chat bubble. Aligns right (accent) for the current user and left
 /// (neutral) for everyone else; shows the short pubkey and time above it.
+/// Other people's messages also show a tappable mute button.
 private struct MessageRow: View {
     let message: ChatMessage
     let isMine: Bool
+    /// Provided only for messages that aren't mine; tapping it mutes the author.
+    var onMute: (() -> Void)? = nil
 
     var body: some View {
-        HStack {
+        HStack(alignment: .bottom, spacing: 6) {
             if isMine { Spacer(minLength: 40) }
 
             VStack(alignment: isMine ? .trailing : .leading, spacing: 2) {
@@ -180,7 +178,17 @@ private struct MessageRow: View {
                     .clipShape(RoundedRectangle(cornerRadius: 16))
             }
 
-            if !isMine { Spacer(minLength: 40) }
+            if let onMute {
+                Button(action: onMute) {
+                    Image(systemName: "speaker.slash")
+                        .font(.caption)
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("Mute this fan")
+            }
+
+            if !isMine { Spacer(minLength: 20) }
         }
     }
 }

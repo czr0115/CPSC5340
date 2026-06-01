@@ -43,14 +43,24 @@ final class NostrService: ObservableObject {
     // MARK: - Start (identity + socket + listen)
 
     func start() {
-        // 1) Identity — ephemeral keypair for the spike (Keychain comes later).
+        // 1) Identity — load the persistent key from the Keychain. If none is
+        //    stored yet (e.g. running this screen before onboarding), generate
+        //    one and save it so the identity is stable across launches.
         do {
-            let sk = try secp256k1.Signing.PrivateKey()
+            let sk: secp256k1.Signing.PrivateKey
+            if let stored = try KeychainService.loadSecretKey() {
+                sk = try secp256k1.Signing.PrivateKey(dataRepresentation: Data(stored))
+                append("🔑 loaded key from Keychain")
+            } else {
+                sk = try secp256k1.Signing.PrivateKey()
+                try KeychainService.saveSecretKey([UInt8](sk.dataRepresentation))
+                append("🔑 generated + saved new key")
+            }
             privateKey = sk
             pubkeyHex = Data(sk.publicKey.xonly.bytes).hexString  // 32-byte x-only pubkey
             append("🔑 pubkey \(pubkeyHex.prefix(12))…")
         } catch {
-            append("❌ key generation failed: \(error)")
+            append("❌ key setup failed: \(error)")
             return
         }
 
