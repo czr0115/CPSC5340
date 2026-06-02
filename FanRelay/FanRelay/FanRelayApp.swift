@@ -3,25 +3,41 @@ import SwiftUI
 @main
 struct FanRelayApp: App {
 
-    /// Whether a key already exists in the Keychain. Drives which screen shows
-    /// at launch: an existing key → straight into the app; none → onboarding.
-    /// `@State` so that finishing onboarding can flip it and swap the view.
+    /// Does a Nostr key already exist in the Keychain? Drives the first gate:
+    /// no key → onboarding.
     @State private var hasIdentity = KeychainService.hasSecretKey()
+
+    /// One shared favorites store for the whole app.
+    @StateObject private var favorites = FavoritesStore()
 
     var body: some Scene {
         WindowGroup {
-            if hasIdentity {
-                // Temporary root for now — one hardcoded room. This becomes the
-                // real Home/feed screen in later build steps.
-                NavigationStack {
-                    ChatRoomView(room: "fanrelay:nfl:eagles")
-                }
-            } else {
-                OnboardingView {
-                    // Called when onboarding saves a key. Re-check the Keychain
-                    // and flip into the app.
-                    hasIdentity = KeychainService.hasSecretKey()
-                }
+            rootView
+                .environmentObject(favorites)
+        }
+    }
+
+    /// The launch flow as a three-way gate:
+    ///   no identity            → Onboarding
+    ///   identity, no favorites → Favorites picker (first run)
+    ///   identity + favorites   → Home
+    @ViewBuilder
+    private var rootView: some View {
+        if !hasIdentity {
+            OnboardingView {
+                hasIdentity = KeychainService.hasSecretKey()
+            }
+        } else if !favorites.hasFavorites {
+            NavigationStack {
+                FavoritesView(onDone: {
+                    // Continue tapped — favorites are saved; this just dismisses
+                    // the picker. Because `favorites.hasFavorites` is now true,
+                    // the gate falls through to Home on the next render.
+                }, showsContinue: true)
+            }
+        } else {
+            NavigationStack {
+                HomeView()
             }
         }
     }

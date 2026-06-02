@@ -31,6 +31,10 @@ final class NostrService: ObservableObject {
     // Mute (NIP-51, kind 10000): pubkeys this user has muted.
     @Published var mutedPubkeys: Set<String> = []
 
+    // Fan discovery (NIP-78, kind 30078): pubkeys following the league we're
+    // currently browsing, mapped to the set of fanrelay tags they follow.
+    @Published var discoveredFans: [String: Set<String>] = [:]
+
     private var session: URLSession?
     private var task: URLSessionWebSocketTask?
     private var privateKey: secp256k1.Signing.PrivateKey?
@@ -187,6 +191,10 @@ final class NostrService: ObservableObject {
             applyMuteEvent(ev)
             return
         }
+        if kind == 30078 {
+            applyAffiliationEvent(ev)
+            return
+        }
         guard kind == 1 else { return }
 
         guard
@@ -287,6 +295,71 @@ final class NostrService: ObservableObject {
         } catch {
             append("❌ mute build/sign failed: \(error)")
         }
+    }
+
+    // MARK: - Affiliation list (NIP-78 app-data, kind 30078)
+
+    /// The `d` identifier that makes our affiliation list addressable/replaceable.
+    /// Publishing again with the same `d` replaces the prior list rather than
+    /// stacking duplicates — so updating teams just overwrites.
+    private let affiliationD = "fanrelay-teams"
+
+    /// Publish this user's followed leagues as a replaceable list, one `t` tag
+    /// per league (e.g. ["t","fanrelay:nfl"]). This is what makes a user
+    /// discoverable to other fans following the same league.
+    ///
+    /// `leagueTags` are the raw room-tag strings, e.g. "fanrelay:nfl".
+    func publishAffiliation(leagueTags: [String]) {
+        guard let task else { append("⚠️ not connected"); return }
+        // The `d` tag (addressable identifier) plus one `t` tag per league.
+        var tags: [[String]] = [["d", affiliationD]]
+        tags.append(contentsOf: leagueTags.map { ["t", $0] })
+        do {
+            let event = try makeSignedEvent(kind: 30078, tags: tags, content: "")
+            let wire = try wireMessage(["EVENT", event])
+            Task {
+                do { try await task.send(.string(wire)) }
+                catch { self.append("❌ affiliation publish failed: \(error.localizedDescription)") }
+            }
+            append("📣 affiliation updated (\(leagueTags.count) leagues)")
+        } catch {
+            append("❌ affiliation build/sign failed: \(error)")
+        }
+    }
+
+    /// Find other fans following a given league tag. Subscribes for kind-30078
+    /// events carrying that `t` tag; each match flows through `ingestEvent` →
+    /// `applyAffiliationEvent`, populating `discoveredFans`.
+    func discoverFans(forLeagueTag tag: String, subscriptionId: String = "fanrelay-fans") {
+        guard let task else { return }
+        discoveredFans = [:]   // fresh search
+        let filter: [String: Any] = ["kinds": [30078], "#t": [tag], "limit": 100]
+        do {
+            let wire = try wireMessage(["REQ", subscriptionId, filter])
+            Task {
+                do { try await task.send(.string(wire)) }
+                catch { self.append("❌ fan discovery failed: \(error.localizedDescription)") }
+            }
+            append("👥 discovering fans of \(tag)")
+        } catch {
+            append("❌ fan discovery build failed: \(error)")
+        }
+    }
+
+    /// Read a kind-30078 event's `t` tags and record which fanrelay leagues the
+    /// author follows. Keyed by pubkey, so a fan appears once with all their
+    /// followed leagues.
+    private func applyAffiliationEvent(_ ev: [String: Any]) {
+        guard
+            let pubkey = ev["pubkey"] as? String,
+            let tags = ev["tags"] as? [[String]]
+        else { return }
+        var leagues = Set<String>()
+        for tag in tags where tag.first == "t" && tag.count > 1 {
+            leagues.insert(tag[1])
+        }
+        guard !leagues.isEmpty else { return }
+        discoveredFans[pubkey] = leagues
     }
 
     // MARK: - Build + sign a NIP-01 event

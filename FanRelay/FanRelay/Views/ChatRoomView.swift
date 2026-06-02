@@ -10,10 +10,15 @@ struct ChatRoomView: View {
 
     @StateObject private var vm: ChatRoomViewModel
 
+    /// An explicit title (e.g. the league's "NFL"). When nil, we derive one
+    /// from the room tag as a fallback.
+    private let explicitTitle: String?
+
     /// The room tag is needed to build the ViewModel, so we create the
     /// `@StateObject` in `init` rather than inline.
-    init(room: String) {
+    init(room: String, title: String? = nil) {
         _vm = StateObject(wrappedValue: ChatRoomViewModel(room: room))
+        self.explicitTitle = title
     }
 
     var body: some View {
@@ -139,8 +144,9 @@ struct ChatRoomView: View {
         !vm.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    /// "fanrelay:nfl:eagles" → "Eagles" for the title bar.
+    /// "fanrelay:nfl:eagles" → "Eagles" for the title bar (fallback only).
     private var roomTitle: String {
+        if let explicitTitle { return explicitTitle }
         let last = vm.room.split(separator: ":").last.map(String.init) ?? vm.room
         return last.capitalized
     }
