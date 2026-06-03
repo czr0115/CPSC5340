@@ -8,6 +8,11 @@ import SwiftUI
 struct HomeView: View {
 
     @EnvironmentObject private var favorites: FavoritesStore
+    @EnvironmentObject private var nostr: NostrService
+
+    /// Flipped true when the user resets identity in Settings; FanRelayApp
+    /// watches this to route back to onboarding.
+    @Binding var didResetIdentity: Bool
 
     var body: some View {
         Group {
@@ -18,6 +23,15 @@ struct HomeView: View {
             }
         }
         .navigationTitle("My Feed")
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                NavigationLink {
+                    SettingsView(service: nostr, didResetIdentity: $didResetIdentity)
+                } label: {
+                    Image(systemName: "gearshape")
+                }
+            }
+        }
     }
 
     // MARK: - Feed
@@ -32,7 +46,12 @@ struct HomeView: View {
                         Label("Scores & Schedule", systemImage: "sportscourt")
                     }
                     NavigationLink {
-                        ChatRoomView(room: roomTag(for: league), title: league.displayName)
+                        StandingsView(league: league)
+                    } label: {
+                        Label("Standings", systemImage: "list.number")
+                    }
+                    NavigationLink {
+                        ChatRoomView(room: roomTag(for: league), title: league.displayName, service: nostr)
                     } label: {
                         Label("Fan Chat", systemImage: "bubble.left.and.bubble.right")
                     }
@@ -40,6 +59,13 @@ struct HomeView: View {
                         NewsView(query: league.displayName, title: league.displayName)
                     } label: {
                         Label("News", systemImage: "newspaper")
+                    }
+                    NavigationLink {
+                        DiscoveryView(leagueTag: roomTag(for: league),
+                                      title: league.displayName,
+                                      service: nostr)
+                    } label: {
+                        Label("Fans", systemImage: "person.2")
                     }
                 }
             }
@@ -66,9 +92,9 @@ struct HomeView: View {
 }
 
 #Preview {
-    let store = FavoritesStore()
-    return NavigationStack {
-        HomeView()
-            .environmentObject(store)
+    NavigationStack {
+        HomeView(didResetIdentity: .constant(false))
+            .environmentObject(FavoritesStore())
+            .environmentObject(NostrService())
     }
 }

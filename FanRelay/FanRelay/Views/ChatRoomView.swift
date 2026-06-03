@@ -15,9 +15,11 @@ struct ChatRoomView: View {
     private let explicitTitle: String?
 
     /// The room tag is needed to build the ViewModel, so we create the
-    /// `@StateObject` in `init` rather than inline.
-    init(room: String, title: String? = nil) {
-        _vm = StateObject(wrappedValue: ChatRoomViewModel(room: room))
+    /// `@StateObject` in `init` rather than inline. `service` lets a parent pass
+    /// the shared app-level NostrService; when nil the VM makes its own (e.g.
+    /// previews), thanks to its injectable init.
+    init(room: String, title: String? = nil, service: NostrService? = nil) {
+        _vm = StateObject(wrappedValue: ChatRoomViewModel(room: room, service: service))
         self.explicitTitle = title
     }
 
@@ -42,15 +44,22 @@ struct ChatRoomView: View {
                         .frame(maxWidth: .infinity)
                         .padding(.top, 60)
                 } else {
-                    LazyVStack(spacing: 8) {
-                        ForEach(vm.messages) { message in
+                    LazyVStack(spacing: 2) {
+                        ForEach(Array(vm.messages.enumerated()), id: \.element.id) { index, message in
+                            let prev = index > 0 ? vm.messages[index - 1] : nil
+                            // First message in a run from this sender shows the
+                            // avatar + name header; consecutive ones don't.
+                            let showsHeader = prev?.pubkey != message.pubkey
                             MessageRow(
                                 message: message,
                                 isMine: vm.isMine(message),
+                                profile: vm.profile(for: message.pubkey),
+                                showsHeader: showsHeader,
                                 // Only other people's messages get a mute action.
                                 onMute: vm.isMine(message) ? nil : { vm.mute(message) }
                             )
                             .id(message.id)
+                            .padding(.top, showsHeader ? 8 : 0)
                         }
                     }
                     .padding(.horizontal, 12)
@@ -160,41 +169,91 @@ struct ChatRoomView: View {
 private struct MessageRow: View {
     let message: ChatMessage
     let isMine: Bool
+    let profile: NostrProfile?
+    /// First message in a run from this sender? Shows avatar + name if so.
+    let showsHeader: Bool
     /// Provided only for messages that aren't mine; tapping it mutes the author.
     var onMute: (() -> Void)? = nil
 
+    /// Sender's display name: profile name if known, else short pubkey.
+    private var senderName: String {
+        profile?.name ?? message.shortPubkey
+    }
+
     var body: some View {
         HStack(alignment: .bottom, spacing: 6) {
-            if isMine { Spacer(minLength: 40) }
+            if isMine {
+                Spacer(minLength: 40)
+                bubbleColumn
+            } else {
+                // Avatar gutter — image on a run's first message, else blank
+                // space so consecutive bubbles still align under it.
+                avatarGutter
+                bubbleColumn
+                if let onMute {
+                    Button(action: onMute) {
+                        Image(systemName: "speaker.slash").font(.caption)
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel("Mute this fan")
+                }
+                Spacer(minLength: 20)
+            }
+        }
+    }
 
-            VStack(alignment: isMine ? .trailing : .leading, spacing: 2) {
+    // MARK: - Bubble + (grouped) header
+
+    private var bubbleColumn: some View {
+        VStack(alignment: isMine ? .trailing : .leading, spacing: 2) {
+            // Name + time only at the start of a run (group-chat style).
+            if showsHeader {
                 HStack(spacing: 4) {
-                    Text(message.shortPubkey)
-                    Text("·")
+                    if !isMine {
+                        Text(senderName).fontWeight(.semibold)
+                        Text("·")
+                    }
                     Text(message.createdAt.formatted(date: .omitted, time: .shortened))
                 }
                 .font(.caption2)
                 .foregroundStyle(.secondary)
-
-                Text(message.content)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    .background(isMine ? Color.accentColor : Color(.secondarySystemBackground))
-                    .foregroundStyle(isMine ? Color.white : Color.primary)
-                    .clipShape(RoundedRectangle(cornerRadius: 16))
             }
 
-            if let onMute {
-                Button(action: onMute) {
-                    Image(systemName: "speaker.slash")
-                        .font(.caption)
-                }
-                .buttonStyle(.borderless)
+            Text(message.content)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(isMine ? Color.accentColor : Color(.secondarySystemBackground))
+                .foregroundStyle(isMine ? Color.white : Color.primary)
+                .clipShape(RoundedRectangle(cornerRadius: 16))
+        }
+    }
+
+    /// 32pt avatar slot. Shows the profile picture (or person-icon fallback) on
+    /// a run's first message; otherwise an empty spacer so bubbles stay aligned.
+    @ViewBuilder
+    private var avatarGutter: some View {
+        if showsHeader {
+            let placeholder = Image(systemName: "person.crop.circle.fill")
+                .font(.title2)
                 .foregroundStyle(.secondary)
-                .accessibilityLabel("Mute this fan")
+            Group {
+                if let url = profile?.avatarURL {
+                    AsyncImage(url: url) { phase in
+                        if case .success(let image) = phase {
+                            image.resizable().scaledToFill()
+                        } else {
+                            placeholder
+                        }
+                    }
+                } else {
+                    placeholder
+                }
             }
-
-            if !isMine { Spacer(minLength: 20) }
+            .frame(width: 32, height: 32)
+            .clipShape(Circle())
+        } else {
+            Color.clear.frame(width: 32, height: 32)
         }
     }
 }

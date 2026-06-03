@@ -8,6 +8,7 @@ import SwiftUI
 struct ScoresView: View {
 
     @StateObject private var vm: ScoresViewModel
+    @EnvironmentObject private var nostr: NostrService
 
     init(league: SportsAPIService.League) {
         _vm = StateObject(wrappedValue: ScoresViewModel(league: league))
@@ -39,7 +40,22 @@ struct ScoresView: View {
 
     private func gamesList(_ games: [Game]) -> some View {
         List(games) { game in
-            GameRow(game: game)
+            VStack(spacing: 6) {
+                GameRow(game: game)
+                // Live games get their own chat room, scoped to the event id.
+                if game.state == .live {
+                    NavigationLink {
+                        ChatRoomView(room: "fanrelay:event:\(game.id)",
+                                     title: "\(game.awayTeam.abbreviation) vs \(game.homeTeam.abbreviation) — Live",
+                                     service: nostr)
+                    } label: {
+                        Label("Join live chat", systemImage: "dot.radiowaves.left.and.right")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.red)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+            }
         }
         .listStyle(.plain)
         .refreshable { await vm.load() }   // pull-to-refresh

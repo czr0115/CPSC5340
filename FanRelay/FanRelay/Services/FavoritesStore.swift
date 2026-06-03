@@ -42,6 +42,12 @@ final class FavoritesStore: ObservableObject {
         save()
     }
 
+    /// Wipe all favorites (used when resetting identity for a clean fresh start).
+    func clear() {
+        followed = []
+        save()
+    }
+
     // MARK: - Persistence
 
     private func save() {

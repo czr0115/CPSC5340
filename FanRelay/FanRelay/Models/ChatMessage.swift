@@ -1,10 +1,3 @@
-//
-//  ChatMessage.swift
-//  FanRelay
-//
-//  Created by critter on 5/31/26.
-//
-
 import Foundation
 
 /// One chat message in a FanRelay room.

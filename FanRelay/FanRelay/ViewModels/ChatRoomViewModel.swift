@@ -24,6 +24,9 @@ final class ChatRoomViewModel: ObservableObject {
     /// Mirrors the relay connection so the View can disable Send while offline.
     @Published private(set) var isConnected = false
 
+    /// Live profile cache for sender names/avatars in bubbles.
+    @Published private(set) var profiles: [String: NostrProfile] = [:]
+
     /// The room tag this screen is bound to, e.g. "fanrelay:nfl:eagles".
     let room: String
 
@@ -42,9 +45,9 @@ final class ChatRoomViewModel: ObservableObject {
     /// rooms. For now each room spins up its own, which keeps step 2 fully
     /// demoable on its own.
     init(room: String, service: NostrService? = nil) {
-            self.room = room
-            self.service = service ?? NostrService()
-        }
+        self.room = room
+        self.service = service ?? NostrService()
+    }
 
     // MARK: - Lifecycle
 
@@ -72,7 +75,17 @@ final class ChatRoomViewModel: ObservableObject {
         service.$isConnected
             .assign(to: &$isConnected)
 
-        service.start()
+        // Mirror the shared profile cache so bubbles can show names + avatars.
+        service.$profiles
+            .sink { [weak self] in self?.profiles = $0 }
+            .store(in: &cancellables)
+
+        // Connect only if the service isn't already running. With the shared
+        // app-level service this is already connected; a per-screen service
+        // (e.g. previews) still gets started here.
+        if !service.isConnected {
+            service.start()
+        }
 
         // The websocket needs a beat to open before it will accept a REQ.
         // (Same one-second pause the slice used; we'll swap it for a real
@@ -135,8 +148,23 @@ final class ChatRoomViewModel: ObservableObject {
     /// Rebuild the visible list: this room only, with muted authors removed.
     /// Called on every incoming event and whenever the mute set changes.
     private func recomputeMessages() {
-        messages = service.roomMessages.filter { message in
-            message.roomId == room && !mutedPubkeys.contains(message.pubkey)
+        let visible = service.roomMessages
+            .filter { message in
+                message.roomId == room && !mutedPubkeys.contains(message.pubkey)
+            }
+            .sorted {
+                $0.createdAt == $1.createdAt ? $0.id < $1.id : $0.createdAt < $1.createdAt
+            }
+        messages = visible
+        // Fetch profiles for everyone in the room (cached ones are skipped).
+        let senders = Array(Set(visible.map(\.pubkey)))
+        if !senders.isEmpty {
+            service.fetchProfiles(for: senders)
         }
+    }
+
+    /// A sender's profile if we have one (name/avatar), else nil.
+    func profile(for pubkey: String) -> NostrProfile? {
+        profiles[pubkey]
     }
 }

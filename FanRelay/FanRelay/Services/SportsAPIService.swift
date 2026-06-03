@@ -82,6 +82,60 @@ final class SportsAPIService {
         }
     }
 
+    /// Fetch standings for a league, grouped by conference/division. Returns an
+    /// ordered list of `Standing` (already in seed order within each group).
+    ///
+    /// Note: standings use a different ESPN base than the scoreboard, and the
+    /// World Cup (group-stage tables) isn't supported here — it returns empty,
+    /// which the UI shows as a friendly "not available" state.
+    func fetchStandings(for league: League) async throws -> [Standing] {
+        // Soccer standings have a different shape (group tables); skip for MVP.
+        guard league != .worldCup else { return [] }
+
+        let standingsBase = "https://site.api.espn.com/apis/v2/sports"
+        guard let url = URL(string: "\(standingsBase)/\(league.espnPath)/standings") else {
+            throw ServiceError.badURL
+        }
+
+        let (data, response) = try await URLSession.shared.data(from: url)
+        guard let http = response as? HTTPURLResponse else { throw ServiceError.badResponse(-1) }
+        guard (200..<300).contains(http.statusCode) else { throw ServiceError.badResponse(http.statusCode) }
+
+        do {
+            let decoded = try JSONDecoder().decode(ESPNStandings.self, from: data)
+            return Self.makeStandings(from: decoded)
+        } catch {
+            throw ServiceError.decoding(error)
+        }
+    }
+
+    /// Flatten ESPN's children → entries into our ordered [Standing].
+    private static func makeStandings(from root: ESPNStandings) -> [Standing] {
+        var result: [Standing] = []
+        for child in root.children {
+            let group = child.abbreviation ?? child.name ?? ""
+            var groupStandings: [Standing] = []
+            for entry in child.standings.entries {
+                let team = entry.team
+                let record = entry.stats.first { $0.name == "overall" && $0.type == "total" }?.summary
+                let seed = entry.stats.first { $0.type == "playoffseed" }?.displayValue
+                groupStandings.append(Standing(
+                    id: team.id,
+                    rank: Int(seed ?? "") ?? Int.max,
+                    teamName: team.displayName,
+                    teamAbbreviation: team.abbreviation,
+                    logoURL: team.logos?.first.flatMap { URL(string: $0.href) },
+                    record: record ?? "—",
+                    groupName: group
+                ))
+            }
+            // ESPN doesn't return entries in seed order, so sort within the group.
+            groupStandings.sort { $0.rank < $1.rank }
+            result.append(contentsOf: groupStandings)
+        }
+        return result
+    }
+
     // MARK: - Map ESPN types → our Game
 
     /// ESPN sends times like "2026-06-01T22:40Z" — note: hours and minutes,
@@ -180,4 +234,43 @@ private struct ESPNStatusType: Decodable {
     let state: String?         // "pre" | "in" | "post"
     let detail: String?
     let shortDetail: String?
+}
+
+// MARK: - Standings decodable types
+
+private struct ESPNStandings: Decodable {
+    let children: [ESPNStandingsChild]
+}
+
+private struct ESPNStandingsChild: Decodable {
+    let name: String?
+    let abbreviation: String?
+    let standings: ESPNStandingsTable
+}
+
+private struct ESPNStandingsTable: Decodable {
+    let entries: [ESPNStandingsEntry]
+}
+
+private struct ESPNStandingsEntry: Decodable {
+    let team: ESPNStandingsTeam
+    let stats: [ESPNStandingsStat]
+}
+
+private struct ESPNStandingsTeam: Decodable {
+    let id: String
+    let displayName: String
+    let abbreviation: String
+    let logos: [ESPNLogo]?
+}
+
+private struct ESPNLogo: Decodable {
+    let href: String
+}
+
+private struct ESPNStandingsStat: Decodable {
+    let name: String?
+    let type: String?
+    let summary: String?
+    let displayValue: String?
 }

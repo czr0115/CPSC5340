@@ -35,12 +35,21 @@ final class NostrService: ObservableObject {
     // currently browsing, mapped to the set of fanrelay tags they follow.
     @Published var discoveredFans: [String: Set<String>] = [:]
 
+    // Profiles (kind 0): pubkey → profile metadata, cached as they arrive.
+    @Published var profiles: [String: NostrProfile] = [:]
+
     private var session: URLSession?
     private var task: URLSessionWebSocketTask?
     private var privateKey: secp256k1.Signing.PrivateKey?
     private var pubkeyHex = ""
 
     private let relayURL = URL(string: "wss://relay.damus.io")!
+
+    /// The relays this app connects to, for display in Settings. Read-only for
+    /// now (single relay); editing would require reconnect/persistence logic.
+    var activeRelays: [String] {
+        [relayURL.absoluteString]
+    }
     private let roomTag  = "fanrelay:test"      // deterministic room id
     private let subId    = "fanrelay-slice"
 
@@ -84,6 +93,33 @@ final class NostrService: ObservableObject {
     /// The current user's public key (x-only hex). The ViewModel uses this to
     /// tell "my" messages from others'. Empty until `start()` has run.
     var myPubkey: String { pubkeyHex }
+
+    /// The user's public key as a NIP-19 `npub…` string for display.
+    /// Empty if encoding fails or the key isn't loaded yet.
+    var myNpub: String {
+        guard let bytes = hexToBytes(pubkeyHex), !bytes.isEmpty else { return "" }
+        return (try? NIP19.encodePublicKey(bytes)) ?? ""
+    }
+
+    /// The user's secret key as a NIP-19 `nsec…` string, read from the Keychain
+    /// on demand for backup/export. Returns nil if unavailable. Handle with care.
+    func exportNsec() -> String? {
+        guard let secret = ((try? KeychainService.loadSecretKey()) ?? nil) else { return nil }
+        return try? NIP19.encodeSecretKey(secret)
+    }
+
+    private func hexToBytes(_ hex: String) -> [UInt8]? {
+        guard hex.count % 2 == 0 else { return nil }
+        var bytes = [UInt8]()
+        var idx = hex.startIndex
+        while idx < hex.endIndex {
+            let next = hex.index(idx, offsetBy: 2)
+            guard let b = UInt8(hex[idx..<next], radix: 16) else { return nil }
+            bytes.append(b)
+            idx = next
+        }
+        return bytes
+    }
 
     // MARK: - Receive loop (async/await)
 
@@ -195,6 +231,10 @@ final class NostrService: ObservableObject {
             applyAffiliationEvent(ev)
             return
         }
+        if kind == 0 {
+            applyProfileEvent(ev)
+            return
+        }
         guard kind == 1 else { return }
 
         guard
@@ -219,7 +259,11 @@ final class NostrService: ObservableObject {
             sig: ev["sig"] as? String ?? ""
         )
         roomMessages.append(message)
-        roomMessages.sort { $0.createdAt < $1.createdAt }   // oldest → newest
+        // Oldest → newest, with id as a stable tiebreaker for same-second
+        // timestamps (Nostr created_at is whole seconds, so ties are common).
+        roomMessages.sort {
+            $0.createdAt == $1.createdAt ? $0.id < $1.id : $0.createdAt < $1.createdAt
+        }
     }
 
     /// The room a note belongs to is the value of its first `t` tag
@@ -360,6 +404,84 @@ final class NostrService: ObservableObject {
         }
         guard !leagues.isEmpty else { return }
         discoveredFans[pubkey] = leagues
+    }
+
+    // MARK: - Profiles (kind 0)
+
+    /// Fetch kind-0 profile metadata for a batch of pubkeys. Each profile that
+    /// comes back flows through `ingestEvent` → `applyProfileEvent` and lands in
+    /// the `profiles` cache. Skips pubkeys we already have to avoid re-querying.
+    func fetchProfiles(for pubkeys: [String], subscriptionId: String = "fanrelay-profiles") {
+        guard let task else { return }
+        let needed = Array(Set(pubkeys)).filter { profiles[$0] == nil && !$0.isEmpty }
+        guard !needed.isEmpty else { return }
+
+        let filter: [String: Any] = ["kinds": [0], "authors": needed, "limit": needed.count]
+        do {
+            let wire = try wireMessage(["REQ", subscriptionId, filter])
+            Task {
+                do { try await task.send(.string(wire)) }
+                catch { self.append("❌ profile fetch failed: \(error.localizedDescription)") }
+            }
+            append("👤 fetching \(needed.count) profile(s)")
+        } catch {
+            append("❌ profile fetch build failed: \(error)")
+        }
+    }
+
+    /// Parse a kind-0 event's JSON content into a NostrProfile and cache it.
+    /// Content looks like {"name":"…","picture":"…","display_name":"…"}.
+    private func applyProfileEvent(_ ev: [String: Any]) {
+        guard
+            let pubkey = ev["pubkey"] as? String,
+            let content = ev["content"] as? String,
+            let data = content.data(using: .utf8),
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return }
+
+        // Prefer "display_name", fall back to "name".
+        let name = (json["display_name"] as? String) ?? (json["name"] as? String)
+        let avatar = (json["picture"] as? String).flatMap(URL.init)
+
+        profiles[pubkey] = NostrProfile(
+            pubkey: pubkey,
+            displayName: name?.trimmingCharacters(in: .whitespacesAndNewlines),
+            avatarURL: avatar
+        )
+        append("👤 profile: \(name ?? pubkey.prefix(8).description)")
+    }
+
+    /// Publish *this user's* kind-0 profile metadata (name + optional picture).
+    /// Kind 0 is replaceable, so this overwrites any prior profile. Updates the
+    /// local cache optimistically so the user's own name/avatar shows at once.
+    func publishProfile(name: String, pictureURL: String?) {
+        guard let task else { append("⚠️ not connected"); return }
+
+        var meta: [String: String] = ["name": name]
+        if let pictureURL, !pictureURL.isEmpty { meta["picture"] = pictureURL }
+
+        guard
+            let data = try? JSONSerialization.data(withJSONObject: meta),
+            let content = String(data: data, encoding: .utf8)
+        else { append("❌ profile encode failed"); return }
+
+        do {
+            let event = try makeSignedEvent(kind: 0, tags: [], content: content)
+            let wire = try wireMessage(["EVENT", event])
+            Task {
+                do { try await task.send(.string(wire)) }
+                catch { self.append("❌ profile publish failed: \(error.localizedDescription)") }
+            }
+            // Optimistic local update for our own pubkey.
+            profiles[pubkeyHex] = NostrProfile(
+                pubkey: pubkeyHex,
+                displayName: name,
+                avatarURL: pictureURL.flatMap(URL.init)
+            )
+            append("👤 published profile: \(name)")
+        } catch {
+            append("❌ profile build/sign failed: \(error)")
+        }
     }
 
     // MARK: - Build + sign a NIP-01 event
